@@ -340,8 +340,12 @@ void RIFF::File::read()
     const unsigned int declaredSize = readBlock(4).toUInt(bigEndian);
 
     if(!isValidChunkName(chnkName)) {
-      debug("RIFF::File::read() -- Chunk '" + chnkName + "' has invalid ID");
-      break;
+      // A single malformed chunk (e.g. tagger residue) must not discard valid
+      // tags that follow. Skip the 8-byte header and keep scanning; the
+      // offset check above keeps the loop bounded.
+      debug("RIFF::File::read() -- Chunk '" + chnkName + "' has invalid ID; skipping");
+      offset += 8;
+      continue;
     }
 
     // "ds64" is required to be the first chunk, so its sizes are known by the time
