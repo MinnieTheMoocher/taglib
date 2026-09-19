@@ -45,6 +45,37 @@ namespace
     }
     return strs;
   }
+
+  // Find the attribute with the given name, ignoring case.
+  ASF::AttributeList findAttribute(const ASF::AttributeListMap &map, const String &name)
+  {
+    const String upperName = name.upper();
+    for(const auto &[k, attributes] : map) {
+      if(k.upper() == upperName)
+        return attributes;
+    }
+    return {};
+  }
+
+  // A POPULARIMETER attribute stores a POPM-style value of the form
+  // "email|rating|counter".  Extract the numeric rating field.
+  String popularimeterRating(const String &attribute)
+  {
+    const StringList parts = attribute.split("|");
+    if(parts.size() == 3)
+      return parts[1];
+    return {};
+  }
+
+  // Rebuild a POPULARIMETER value, replacing the rating field while keeping
+  // the email and counter.
+  String setPopularimeterRating(const String &attribute, const String &rating)
+  {
+    const StringList parts = attribute.split("|");
+    if(parts.size() == 3)
+      return parts[0] + "|" + rating + "|" + parts[2];
+    return rating;
+  }
 }  // namespace
 
 class ASF::Tag::TagPrivate
@@ -299,6 +330,7 @@ namespace
     std::tuple("WM/ToolName", "TOOLNAME", ASF::Attribute::UnicodeType),
     std::tuple("WM/ToolVersion", "TOOLVERSION", ASF::Attribute::UnicodeType),
     std::tuple("WM/Provider", "PROVIDER", ASF::Attribute::UnicodeType),
+    std::tuple("WM/SharedUserRating", "RATING", ASF::Attribute::DWordType),
     std::tuple("WM/UniqueFileIdentifier", "UNIQUEFILEIDENTIFIER", ASF::Attribute::UnicodeType),
     std::tuple("WMFSDKVersion", "WMFSDKVERSION", ASF::Attribute::UnicodeType),
     std::tuple("WMFSDKNeeded", "WMFSDKNEEDED", ASF::Attribute::UnicodeType),
@@ -382,7 +414,13 @@ PropertyMap ASF::Tag::properties() const
   }
 
   for(const auto &[k, attributes] : std::as_const(d->attributeListMap)) {
-    if(const String key = translateKey(k); !key.isEmpty()) {
+    const String key = translateKey(k);
+    if(key == "RATING" || k.upper() == "POPULARIMETER") {
+      // Rating sources are handled below to define precedence and to extract
+      // the numeric rating from the POPM-style POPULARIMETER value.
+      continue;
+    }
+    if(!key.isEmpty()) {
       for(const auto &attr : attributes) {
         // The same attribute can occur in both the extended content
         // description object and the metadata (library) object, skip exact
@@ -395,6 +433,28 @@ PropertyMap ASF::Tag::properties() const
     }
     else {
       props.addUnsupportedData(k);
+    }
+  }
+
+  // Expose the rating through the standard RATING property.  WM/SharedUserRating
+  // (the Windows Media rating, a DWORD on the 0-99 scale) takes precedence over
+  // the POPM-style POPULARIMETER attribute (email|rating|counter, 0-255).
+  if(const ASF::AttributeList sharedRatings =
+       findAttribute(d->attributeListMap, "WM/SharedUserRating");
+     !sharedRatings.isEmpty()) {
+    for(const auto &attr : sharedRatings) {
+      if(const String value = attributeToString(attr);
+         !props.value("RATING").contains(value)) {
+        props.insert("RATING", value);
+      }
+    }
+  }
+  else {
+    for(const auto &attr : findAttribute(d->attributeListMap, "POPULARIMETER")) {
+      if(const String value = popularimeterRating(attr.toString());
+         !value.isEmpty() && !props.value("RATING").contains(value)) {
+        props.insert("RATING", value);
+      }
     }
   }
   return props;
@@ -431,6 +491,11 @@ PropertyMap ASF::Tag::setProperties(const PropertyMap &props)
       else if(prop == "COPYRIGHT") {
         d->copyright.clear();
       }
+      else if(prop == "RATING") {
+        // Remove both rating sources to keep the round-trip lossless.
+        eraseAttribute(d->attributeListMap, "WM/SharedUserRating");
+        eraseAttribute(d->attributeListMap, "POPULARIMETER");
+      }
       else {
         eraseAttribute(d->attributeListMap, reverseKeyMap[prop].first);
       }
@@ -439,7 +504,24 @@ PropertyMap ASF::Tag::setProperties(const PropertyMap &props)
 
   PropertyMap ignoredProps;
   for(const auto &[prop, attributes] : props) {
-    if(reverseKeyMap.contains(prop)) {
+    if(prop == "RATING") {
+      // Update the existing rating attribute to preserve the file's tagging
+      // convention (foobar2000-style POPULARIMETER vs Windows Media), and
+      // write the canonical WM/SharedUserRating otherwise.
+      if(findAttribute(d->attributeListMap, "WM/SharedUserRating").isEmpty() &&
+         !findAttribute(d->attributeListMap, "POPULARIMETER").isEmpty()) {
+        const String old = findAttribute(d->attributeListMap, "POPULARIMETER").front().toString();
+        eraseAttribute(d->attributeListMap, "POPULARIMETER");
+        for(const auto &str : attributes)
+          addAttribute("POPULARIMETER", setPopularimeterRating(old, str));
+      }
+      else {
+        eraseAttribute(d->attributeListMap, "WM/SharedUserRating");
+        for(const auto &str : attributes)
+          addAttribute("WM/SharedUserRating", static_cast<unsigned int>(str.toULongLong()));
+      }
+    }
+    else if(reverseKeyMap.contains(prop)) {
       const auto &[name, type] = reverseKeyMap[prop];
       eraseAttribute(d->attributeListMap, name);
       for(const auto &str : attributes) {
