@@ -25,6 +25,8 @@
 
 #include "wavfile.h"
 
+#include <optional>
+
 #include "tdebug.h"
 #include "tpropertymap.h"
 #include "tagutils.h"
@@ -254,6 +256,9 @@ bool RIFF::WAV::File::hasBEXTData() const
 
 void RIFF::WAV::File::read(bool readProperties)
 {
+  std::optional<unsigned int> codePage;
+  ByteVector infoData;
+
   for(unsigned int i = 0; i < chunkCount(); ++i) {
     if(const ByteVector name = chunkName(i); name == "ID3 " || name == "id3 ") {
       if(!d->tag[ID3v2Index]) {
@@ -265,14 +270,19 @@ void RIFF::WAV::File::read(bool readProperties)
         debug("RIFF::WAV::File::read() - Duplicate ID3v2 tag found.");
       }
     }
+    else if(name == "CSET") {
+      if(const ByteVector data = chunkData(i); data.size() >= 2)
+        codePage = static_cast<unsigned int>(data.toUShort(0, false));
+      else
+        debug("RIFF::WAV::File::read() - Invalid CSET chunk found.");
+    }
     else if(name == "LIST") {
       if(const ByteVector data = chunkData(i); data.startsWith("INFO")) {
-        if(!d->tag[InfoIndex]) {
-          d->tag.set(InfoIndex, new RIFF::Info::Tag(data));
-          d->hasInfo = true;
+        if(!infoData.isEmpty()) {
+          debug("RIFF::WAV::File::read() - Duplicate INFO tag found.");
         }
         else {
-          debug("RIFF::WAV::File::read() - Duplicate INFO tag found.");
+          infoData = data;
         }
       }
     }
@@ -284,6 +294,11 @@ void RIFF::WAV::File::read(bool readProperties)
       d->hasBEXT = true;
       d->bextData = chunkData(i);
     }
+  }
+
+  if(!infoData.isEmpty()) {
+    d->tag.set(InfoIndex, new RIFF::Info::Tag(infoData, codePage.value_or(0)));
+    d->hasInfo = true;
   }
 
   if(!d->tag[ID3v2Index])

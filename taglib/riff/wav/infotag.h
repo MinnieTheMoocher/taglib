@@ -45,9 +45,9 @@ namespace TagLib {
     //! An abstraction for the string to data encoding in Info tags.
 
     /*!
-     * RIFF INFO tag has no clear definitions about character encodings.
-     * In practice, local encoding of each system is largely used and UTF-8 is
-     * popular too.
+     * Per the RIFF specification, the character encoding of the INFO tag is
+     * declared with a top-level CSET chunk; when it is absent, the default is
+     * the ISO 8859-1 (Latin-1) ANSI code page.
      *
      * Here is an option to read and write tags in your preferred encoding
      * by subclassing this class, reimplementing parse() and render() and setting
@@ -67,7 +67,8 @@ namespace TagLib {
 
       /*!
        * Decode a string from \a data.  The default implementation assumes that
-       * \a data is an UTF-8 character array.
+       * \a data is an ISO 8859-1 (Latin-1) character array, which is the RIFF
+       * default when the file declares no CSET code page.
        */
       virtual String parse(const ByteVector &data) const;
 
@@ -104,6 +105,18 @@ namespace TagLib {
        * Constructs an INFO tag read from \a data which is the contents of the "LIST" chunk.
        */
       Tag(const ByteVector &data);
+
+      /*!
+       * Constructs an INFO tag read from \a data which is the contents of the "LIST" chunk,
+       * decoding the text with the code page \a codePage declared by the file's top-level
+       * CSET chunk.
+       *
+       * The RIFF default - used when a file has no CSET chunk, and what code page 0
+       * means - is ISO 8859-1 (Latin-1).  Code pages 28591 (Latin-1) and
+       * 1252 (Windows-1252) and 65001 (UTF-8) are also supported.  For any other
+       * code page every field of the tag stays empty.
+       */
+      Tag(const ByteVector &data, unsigned int codePage);
 
       ~Tag() override;
 
@@ -173,17 +186,18 @@ namespace TagLib {
        */
       ByteVector render() const;
 
-      /*!
-       * Sets the string handler that decides how the text data will be
-       * converted to and from binary data.
-       * If the parameter \a handler is null, the previous handler is
-       * released and default UTF-8 handler is restored.
-       *
-       * \note The caller is responsible for deleting the previous handler
-       * as needed after it is released.
-       *
-       * \see StringHandler
-       */
+/*!
+        * Sets the string handler that decides how the text data will be
+        * converted to and from binary data.
+        * If the parameter \a handler is null, the previous handler is
+        * released and the default (ISO 8859-1 decode, UTF-8 encode) handler
+        * is restored.
+        *
+        * \note The caller is responsible for deleting the previous handler
+        * as needed after it is released.
+        *
+        * \see StringHandler
+        */
       static void setStringHandler(const StringHandler *handler);
 
     protected:

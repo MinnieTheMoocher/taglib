@@ -69,6 +69,10 @@ class TestWAV : public CppUnit::TestFixture
   CPPUNIT_TEST(testBEXTTagWithOtherTags);
   CPPUNIT_TEST(testiXMLTag);
   CPPUNIT_TEST(testiXMLTagWithOtherTags);
+  CPPUNIT_TEST(testInfoLatin1Default);
+  CPPUNIT_TEST(testInfoWindows1252);
+  CPPUNIT_TEST(testInfoUtf8);
+  CPPUNIT_TEST(testInfoUnsupportedCset);
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -234,6 +238,45 @@ public:
       CPPUNIT_ASSERT_EQUAL(String(L""), f.InfoTag()->title());
       CPPUNIT_ASSERT_EQUAL(String(L""), f.InfoTag()->artist());
     }
+  }
+
+  void testInfoLatin1Default()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-latin1.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"),  f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"),  f.InfoTag()->artist());
+    CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"),   f.InfoTag()->comment());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(2024), f.InfoTag()->year());
+  }
+
+  void testInfoWindows1252()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1252.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L"\x20AC\x201C\x2122Z"), f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(2024), f.InfoTag()->year());
+  }
+
+  void testInfoUtf8()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-utf8.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"), f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(2024), f.InfoTag()->year());
+  }
+
+  void testInfoUnsupportedCset()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1251.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L""), f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(String(L""), f.InfoTag()->comment());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(0), f.InfoTag()->year());
   }
 
   void testStripTags()
