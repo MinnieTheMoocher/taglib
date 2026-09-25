@@ -28,7 +28,6 @@
 #include <utility>
 
 #include "tbytevector.h"
-#include "tdebug.h"
 #include "tpropertymap.h"
 #include "riffutils.h"
 
@@ -39,145 +38,12 @@ namespace
 {
   const RIFF::Info::StringHandler defaultStringHandler;
   const RIFF::Info::StringHandler *stringHandler = &defaultStringHandler;
-
-  enum class InfoEncoding
-  {
-    Latin1,
-    Windows1252,
-    UTF8,
-    Unsupported
-  };
-
-  InfoEncoding encodingForCodePage(unsigned int codePage)
-  {
-    switch(codePage) {
-    case 0:
-    case 28591:
-      return InfoEncoding::Latin1;
-    case 1252:
-      return InfoEncoding::Windows1252;
-    case 65001:
-      return InfoEncoding::UTF8;
-    default:
-      return InfoEncoding::Unsupported;
-    }
-  }
-
-  constexpr std::wstring::value_type windows1252HighBytes[32] = {
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
-    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
-  };
-
-  String decodeWindows1252(const ByteVector &data)
-  {
-    std::wstring text;
-    text.reserve(data.size());
-    for(const char b : data) {
-      if(b == '\0')
-        break;
-      const unsigned char c = static_cast<unsigned char>(b);
-      if(c < 0x80 || c >= 0xA0)
-        text.push_back(c);
-      else
-        text.push_back(windows1252HighBytes[c - 0x80]);
-    }
-    return String(text);
-  }
-
-  char encodeWindows1252Char(wchar_t c)
-  {
-    if(c < 0x80 || (c >= 0xA0 && c <= 0xFF))
-      return static_cast<char>(c);
-
-    for(unsigned int i = 0; i < 32; ++i) {
-      if(windows1252HighBytes[i] == c)
-        return static_cast<char>(0x80 + i);
-    }
-
-    return '?';
-  }
-
-  ByteVector encodeWindows1252(const String &s)
-  {
-    ByteVector out(static_cast<unsigned int>(s.size()), 0);
-    char *p = out.data();
-    for(const wchar_t c : s)
-      *p++ = encodeWindows1252Char(c);
-    return out;
-  }
-
-  class CodePageStringHandler : public RIFF::Info::StringHandler
-  {
-  public:
-    explicit CodePageStringHandler(InfoEncoding encoding) :
-      m_encoding(encoding)
-    {
-    }
-
-    String parse(const ByteVector &data) const override
-    {
-      switch(m_encoding) {
-      case InfoEncoding::UTF8:
-        return String(data, String::UTF8);
-      case InfoEncoding::Windows1252:
-        return decodeWindows1252(data);
-      case InfoEncoding::Latin1:
-        return String(data, String::Latin1);
-      case InfoEncoding::Unsupported:
-        debug("RIFF::Info::Tag::parse() - Unsupported CSET code page, INFO field is skipped.");
-        return String();
-      }
-      return String();
-    }
-
-    ByteVector render(const String &s) const override
-    {
-      switch(m_encoding) {
-      case InfoEncoding::UTF8:
-        return s.data(String::UTF8);
-      case InfoEncoding::Windows1252:
-        return encodeWindows1252(s);
-      case InfoEncoding::Latin1:
-        return s.data(String::Latin1);
-      case InfoEncoding::Unsupported:
-        return ByteVector();
-      }
-      return ByteVector();
-    }
-
-  private:
-    InfoEncoding m_encoding;
-  };
-
-  const RIFF::Info::StringHandler *stringHandlerForCodePage(unsigned int codePage)
-  {
-    static const CodePageStringHandler latin1(InfoEncoding::Latin1);
-    static const CodePageStringHandler windows1252(InfoEncoding::Windows1252);
-    static const CodePageStringHandler utf8(InfoEncoding::UTF8);
-    static const CodePageStringHandler unsupported(InfoEncoding::Unsupported);
-
-    switch(encodingForCodePage(codePage)) {
-    case InfoEncoding::Windows1252:
-      return &windows1252;
-    case InfoEncoding::UTF8:
-      return &utf8;
-    case InfoEncoding::Latin1:
-      return &latin1;
-    case InfoEncoding::Unsupported:
-      return &unsupported;
-    }
-    return &unsupported;
-  }
 } // namespace
 
 class RIFF::Info::Tag::TagPrivate
 {
 public:
   FieldListMap fieldListMap;
-
-  const StringHandler *stringHandler = nullptr;
 };
 
 class RIFF::Info::StringHandler::StringHandlerPrivate
@@ -194,7 +60,7 @@ StringHandler::~StringHandler() = default;
 
 String RIFF::Info::StringHandler::parse(const ByteVector &data) const
 {
-  return String(data, String::Latin1);
+  return String(data, String::UTF8);
 }
 
 ByteVector RIFF::Info::StringHandler::render(const String &s) const
@@ -209,13 +75,6 @@ ByteVector RIFF::Info::StringHandler::render(const String &s) const
 RIFF::Info::Tag::Tag(const ByteVector &data) :
   d(std::make_unique<TagPrivate>())
 {
-  parse(data);
-}
-
-RIFF::Info::Tag::Tag(const ByteVector &data, unsigned int codePage) :
-  d(std::make_unique<TagPrivate>())
-{
-  d->stringHandler = stringHandlerForCodePage(codePage);
   parse(data);
 }
 
@@ -419,11 +278,10 @@ void RIFF::Info::Tag::removeField(const ByteVector &id)
 
 ByteVector RIFF::Info::Tag::render() const
 {
-  const StringHandler *handler = d->stringHandler ? d->stringHandler : stringHandler;
   ByteVector data("INFO");
 
   for(const auto &[field, list] : std::as_const(d->fieldListMap)) {
-    ByteVector text = handler->render(list);
+    ByteVector text = stringHandler->render(list);
     if(text.isEmpty())
       continue;
 
@@ -455,7 +313,6 @@ void RIFF::Info::Tag::setStringHandler(const StringHandler *handler)
 
 void RIFF::Info::Tag::parse(const ByteVector &data)
 {
-  const StringHandler *handler = d->stringHandler ? d->stringHandler : stringHandler;
   unsigned int p = 4;
   while(p < data.size()) {
     const unsigned int size = data.toUInt(p + 4, false);
@@ -463,7 +320,7 @@ void RIFF::Info::Tag::parse(const ByteVector &data)
       break;
 
     if(const ByteVector id = data.mid(p, 4); isValidChunkName(id)) {
-      const String text = handler->parse(data.mid(p + 8, size));
+      const String text = stringHandler->parse(data.mid(p + 8, size));
       d->fieldListMap[id] = text;
     }
 
