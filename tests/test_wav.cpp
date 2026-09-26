@@ -23,9 +23,11 @@
  *   http://www.mozilla.org/MPL/                                           *
  ***************************************************************************/
 
+#include <iterator>
 #include <string>
 #include <cstdio>
 
+#include "charset.h"
 #include "id3v2tag.h"
 #include "infotag.h"
 #include "tbytevectorlist.h"
@@ -39,6 +41,170 @@
 
 using namespace std;
 using namespace TagLib;
+
+namespace
+{
+  // Validates the raw chunk layout of the RIFF file at \a path against the
+  // format itself instead of against TagLib, so that a file TagLib has just
+  // written is checked independently of how TagLib would read it back.  Returns
+  // the data of the first top level chunk called \a name.
+  ByteVector checkedRawChunk(const string &path, const char *name)
+  {
+    const ByteVector wanted(name);
+
+    FileStream stream(path.c_str(), true);
+    CPPUNIT_ASSERT(stream.isOpen());
+
+    const ByteVector header = stream.readBlock(12);
+    CPPUNIT_ASSERT_EQUAL(12u, header.size());
+    CPPUNIT_ASSERT(header.startsWith("RIFF"));
+
+    // The size in the header covers everything after the size field itself,
+    // so the file must be exactly that long: no gap and no trailing junk.
+    const offset_t declaredEnd = static_cast<offset_t>(header.toUInt(4, false)) + 8;
+    CPPUNIT_ASSERT_EQUAL(declaredEnd, stream.length());
+
+    ByteVector found;
+    offset_t offset = 12;
+    while(offset + 8 <= declaredEnd) {
+      stream.seek(offset);
+      const ByteVector chunkHeader = stream.readBlock(8);
+      CPPUNIT_ASSERT_EQUAL(8u, chunkHeader.size());
+
+      const unsigned int size = chunkHeader.toUInt(4, false);
+      const ByteVector data = stream.readBlock(size);
+      CPPUNIT_ASSERT_EQUAL(size, data.size());
+
+      if(found.isEmpty() && chunkHeader.startsWith(wanted))
+        found = data;
+
+      // Chunks are padded to an even length, so an odd size is followed by a
+      // pad byte which is not counted in the size.
+      offset += 8 + size + (size % 2);
+    }
+
+    // The chunks must tile the file exactly, up to and including its end.
+    CPPUNIT_ASSERT_EQUAL(declaredEnd, offset);
+
+    return found;
+  }
+
+  // The bytes of one field of the INFO list of the RIFF file at \a path, as
+  // stored, the NUL that ends the field included. The same walk as
+  // checkedRawChunk(), one level down, inside the LIST.
+  ByteVector checkedRawInfoField(const string &path, const char *name)
+  {
+    const ByteVector list = checkedRawChunk(path, "LIST");
+    CPPUNIT_ASSERT(list.size() >= 4u);
+    CPPUNIT_ASSERT(list.startsWith("INFO"));
+
+    const ByteVector wanted(name);
+    ByteVector found;
+    unsigned int offset = 4;
+    while(offset + 8u <= list.size()) {
+      const ByteVector chunkHeader = list.mid(offset, 8);
+      const unsigned int size = chunkHeader.toUInt(4, false);
+      CPPUNIT_ASSERT(offset + 8u + size <= list.size());
+
+      if(found.isEmpty() && chunkHeader.startsWith(wanted))
+        found = list.mid(offset + 8, size);
+
+      // Padded to an even length, as at the top level.
+      offset += 8 + size + (size % 2);
+    }
+    CPPUNIT_ASSERT_EQUAL(list.size(), offset);
+
+    return found;
+  }
+
+  // The CSET chunk of a saved file must declare UTF-8 and nothing else.
+  void assertRawCsetDeclaresUtf8(const string &path)
+  {
+    const ByteVector cset = checkedRawChunk(path, "CSET");
+    CPPUNIT_ASSERT_EQUAL(2u, cset.size());
+    CPPUNIT_ASSERT_EQUAL(65001u, static_cast<unsigned int>(cset.toUShort(0, false)));
+  }
+
+  // Fixed width hex, so that a byte or code point in a failure message lines up
+  // with the table in test_wav_charset.inc.
+  String hex(unsigned int value, unsigned int digits)
+  {
+    static const char *const d = "0123456789abcdef";
+    String s;
+    for(unsigned int i = digits; i > 0; --i)
+      s += d[(value >> ((i - 1) * 4)) & 0xf];
+    return s;
+  }
+
+  // Turns a repertoire from test_wav_charset.inc into a string: four hex digits
+  // per byte, in byte order. Building it from code points rather than from a wide
+  // string literal keeps this identical whether wchar_t is 16 or 32 bits.
+  String repertoireToString(const char *digits)
+  {
+    std::wstring w;
+    for(const char *p = digits; *p; p += 4) {
+      unsigned int cp = 0;
+      for(int i = 0; i < 4; ++i) {
+        const char c = p[i];
+        cp = (cp << 4) | static_cast<unsigned int>(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+      }
+      w += static_cast<wchar_t>(cp);
+    }
+    return String(w);
+  }
+
+  // A code page's repertoire is 255 bytes of control codes and legacy symbols,
+  // so a mismatch cannot be read off a failure message that prints both sides.
+  // Compare quietly, then report the first byte that went wrong, which is the
+  // only part of the difference worth seeing.
+  void assertDecodedRepertoire(const String &field, const char *digits,
+                               unsigned int codePage, const char *fieldName)
+  {
+    const String expected = repertoireToString(digits);
+    const String id = String::number(codePage) + String(" ") + String(fieldName) + String(" ");
+
+    // Checked first, so that indexing below is in range and a truncated field
+    // is reported as such rather than as a difference at its last character.
+    CPPUNIT_ASSERT_EQUAL(id + String::number(expected.size()),
+                         id + String::number(field.size()));
+
+    unsigned int i = 0;
+    while(i < expected.size() && expected[i] == field[i])
+      ++i;
+
+    const bool identical = (i == expected.size());
+    const String detail = identical
+      ? id + String("matches the repertoire")
+      : id + String("byte 0x") + hex(i + 1, 2)
+        + String(" should be U+") + hex(expected[i], 4)
+        + String(" but is U+") + hex(field[i], 4);
+    CPPUNIT_ASSERT_EQUAL(id + String("matches the repertoire"), detail);
+  }
+
+  // Tags no single byte charset could have represented, as the strings and as
+  // the UTF-8 bytes they have to end up as on disk.
+  const String kNewTitle(L"Title \x4F60\x597D \x20AC");
+  const ByteVector kNewTitleUtf8("Title \xE4\xBD\xA0\xE5\xA5\xBD \xE2\x82\xAC", 16);
+  const String kNewComment(L"\x4F60\x597D");
+  const ByteVector kNewCommentUtf8("\xE4\xBD\xA0\xE5\xA5\xBD", 6);
+
+  // The expectations for every code page, hand maintained: see the header of the
+  // file. They are the other side of every assertion below, so they must not come
+  // from the code they check.
+#include "test_wav_charset.inc"
+
+  // The repertoire test_wav_charset.inc records for one code page, for the tests
+  // that name a single page instead of walking the whole catalog.
+  const char *repertoireFor(unsigned int codePage)
+  {
+    for(const auto &c : charsetCases) {
+      if(c.codePage == codePage)
+        return c.repertoire;
+    }
+    CPPUNIT_FAIL("no repertoire for that code page");
+    return nullptr;
+  }
+}
 
 class TestWAV : public CppUnit::TestFixture
 {
@@ -69,6 +235,22 @@ class TestWAV : public CppUnit::TestFixture
   CPPUNIT_TEST(testBEXTTagWithOtherTags);
   CPPUNIT_TEST(testiXMLTag);
   CPPUNIT_TEST(testiXMLTagWithOtherTags);
+  CPPUNIT_TEST(testInfoLatin1Default);
+  CPPUNIT_TEST(testInfoWindows1252);
+  CPPUNIT_TEST(testInfoUtf8);
+  CPPUNIT_TEST(testInfoLatin1SaveAsUtf8);
+  CPPUNIT_TEST(testInfoWindows1252SaveAsUtf8);
+  CPPUNIT_TEST(testInfoUtf8SaveAsUtf8);
+  CPPUNIT_TEST(testInfoSaveWithoutFieldsWritesNoCset);
+  CPPUNIT_TEST(testInfoSaveWithoutModificationPreservesTag);
+  CPPUNIT_TEST(testInfoStripRemovesCset);
+  CPPUNIT_TEST(testInfoCodePageCatalog);
+  CPPUNIT_TEST(testCharsetFixturesAreTheWholeByteRange);
+  CPPUNIT_TEST(testInfoCodePageCatalogSaveAsUtf8);
+  CPPUNIT_TEST(testCharsetTablesRoundTrip);
+  CPPUNIT_TEST(testCharsetDecodeStopsAtNul);
+  CPPUNIT_TEST(testInfoUserHandlerBeatsCodePage);
+  CPPUNIT_TEST(testInfoCodePageReturnsWithoutUserHandler);
   CPPUNIT_TEST_SUITE_END();
 
 public:
@@ -236,6 +418,442 @@ public:
     }
   }
 
+  void testInfoLatin1Default()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-latin1.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"),  f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"),  f.InfoTag()->artist());
+    CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"),   f.InfoTag()->comment());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(2024), f.InfoTag()->year());
+  }
+
+  void testInfoWindows1252()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1252.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    assertDecodedRepertoire(f.InfoTag()->album(), repertoireFor(1252), 1252, "IPRD");
+  }
+
+  void testInfoUtf8()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-utf8.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"), f.InfoTag()->album());
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(2024), f.InfoTag()->year());
+  }
+
+  // Each of the four fixtures is put through the same two steps.  First it must
+  // parse, with the charset its own CSET chunk declares.  Then its tags are
+  // changed and written to a copy, which rewrites the INFO chunk as UTF-8 and
+  // declares that in a CSET chunk, and the copy must be read back correctly.
+
+  void testInfoLatin1SaveAsUtf8()
+  {
+    // Step 1: the fixture has no CSET chunk, so it is Latin-1 by default.
+    {
+      RIFF::WAV::File f(TEST_FILE_PATH_C("info-latin1.wav"));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"), f.InfoTag()->album());
+      CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"), f.InfoTag()->artist());
+      CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"), f.InfoTag()->comment());
+      CPPUNIT_ASSERT_EQUAL(2024u, f.InfoTag()->year());
+    }
+
+    // Step 2: change the tags of a copy and write it out.
+    ScopedFileCopy copy("info-latin1", ".wav");
+    const string filename = copy.fileName();
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+
+      f.InfoTag()->setTitle(kNewTitle);
+      f.InfoTag()->setComment(kNewComment);
+      CPPUNIT_ASSERT(f.save());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+    }
+
+    // The written file must be a well formed RIFF file that declares UTF-8.
+    assertRawCsetDeclaresUtf8(filename);
+    const ByteVector list = checkedRawChunk(filename, "LIST");
+    CPPUNIT_ASSERT(list.startsWith("INFO"));
+    CPPUNIT_ASSERT(list.find(kNewTitleUtf8) >= 0);
+    CPPUNIT_ASSERT(list.find(kNewCommentUtf8) >= 0);
+
+    // Reading the written copy back must give the changed tags, plus the
+    // fields that were left alone unchanged by the Latin-1 to UTF-8 rewrite.
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(kNewTitle, f.InfoTag()->title());
+      CPPUNIT_ASSERT_EQUAL(kNewComment, f.InfoTag()->comment());
+      CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"), f.InfoTag()->album());
+      CPPUNIT_ASSERT_EQUAL(String(L"A \xAE B"), f.InfoTag()->artist());
+      CPPUNIT_ASSERT_EQUAL(2024u, f.InfoTag()->year());
+    }
+  }
+
+  void testInfoWindows1252SaveAsUtf8()
+  {
+    // Step 1: the fixture declares code page 1252 in its CSET chunk.
+    {
+      RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1252.wav"));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      assertDecodedRepertoire(f.InfoTag()->album(), repertoireFor(1252), 1252, "IPRD");
+    }
+
+    // Step 2: change the tags of a copy and write it out.
+    ScopedFileCopy copy("info-cp1252", ".wav");
+    const string filename = copy.fileName();
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+
+      f.InfoTag()->setTitle(kNewTitle);
+      f.InfoTag()->setComment(kNewComment);
+      CPPUNIT_ASSERT(f.save());
+    }
+
+    // The copy used to declare code page 1252 and now declares UTF-8.
+    assertRawCsetDeclaresUtf8(filename);
+    const ByteVector list = checkedRawChunk(filename, "LIST");
+    CPPUNIT_ASSERT(list.find(kNewTitleUtf8) >= 0);
+    CPPUNIT_ASSERT(list.find(kNewCommentUtf8) >= 0);
+
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(kNewTitle, f.InfoTag()->title());
+      CPPUNIT_ASSERT_EQUAL(kNewComment, f.InfoTag()->comment());
+      assertDecodedRepertoire(f.InfoTag()->album(), repertoireFor(1252), 1252, "IPRD");
+    }
+  }
+
+  void testInfoUtf8SaveAsUtf8()
+  {
+    // Step 1: the fixture already declares UTF-8, and its CSET chunk comes
+    // after the LIST chunk it applies to.
+    {
+      RIFF::WAV::File f(TEST_FILE_PATH_C("info-utf8.wav"));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"), f.InfoTag()->album());
+      CPPUNIT_ASSERT_EQUAL(2024u, f.InfoTag()->year());
+    }
+
+    // Step 2: change the tags of a copy and write it out.
+    ScopedFileCopy copy("info-utf8", ".wav");
+    const string filename = copy.fileName();
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+
+      f.InfoTag()->setTitle(kNewTitle);
+      f.InfoTag()->setComment(kNewComment);
+      CPPUNIT_ASSERT(f.save());
+    }
+
+    assertRawCsetDeclaresUtf8(filename);
+    const ByteVector list = checkedRawChunk(filename, "LIST");
+    CPPUNIT_ASSERT(list.find(kNewTitleUtf8) >= 0);
+    CPPUNIT_ASSERT(list.find(kNewCommentUtf8) >= 0);
+
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(kNewTitle, f.InfoTag()->title());
+      CPPUNIT_ASSERT_EQUAL(kNewComment, f.InfoTag()->comment());
+      CPPUNIT_ASSERT_EQUAL(String(L"Caf\xE9"), f.InfoTag()->album());
+      CPPUNIT_ASSERT_EQUAL(2024u, f.InfoTag()->year());
+    }
+  }
+
+  void testInfoSaveWithoutFieldsWritesNoCset()
+  {
+    ScopedFileCopy copy("info-latin1", ".wav");
+    const string filename = copy.fileName();
+
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+
+      for(const auto &[id, value] : f.InfoTag()->fieldListMap())
+        f.InfoTag()->removeField(id);
+
+      CPPUNIT_ASSERT(f.save());
+      // Nothing is left to describe, so no CSET chunk is written either.
+      CPPUNIT_ASSERT(!f.hasInfoTag());
+    }
+
+    CPPUNIT_ASSERT(checkedRawChunk(filename, "CSET").isEmpty());
+    CPPUNIT_ASSERT(checkedRawChunk(filename, "LIST").isEmpty());
+  }
+
+  // Saving a file that already has an INFO tag must keep that tag. It comes
+  // back in UTF-8 with a CSET chunk saying so, whatever it was read as.
+  void testInfoSaveWithoutModificationPreservesTag()
+  {
+    struct {
+      const char *fixture;
+      const wchar_t *album;   // for the fixtures that are not one code page
+      unsigned int codePage;  // or the code page, checked against its repertoire
+    } cases[] = {
+      {"info-latin1", L"A \xAE B",  0u},
+      {"info-cp1251", nullptr,      1251u},
+      {"info-cp1252", nullptr,      1252u},
+      {"info-utf8",   L"Caf\xE9",  0u}
+    };
+
+    for(const auto &c : cases) {
+      ScopedFileCopy copy(c.fixture, ".wav");
+      const string filename = copy.fileName();
+
+      // Save without touching a single field.
+      {
+        RIFF::WAV::File f(filename.c_str());
+        CPPUNIT_ASSERT(f.isValid());
+        CPPUNIT_ASSERT(f.hasInfoTag());
+        CPPUNIT_ASSERT(f.save());
+      }
+
+      // The tag survived, and the file now declares UTF-8 for it.
+      assertRawCsetDeclaresUtf8(filename);
+      CPPUNIT_ASSERT(checkedRawChunk(filename, "LIST").startsWith("INFO"));
+
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      if(c.codePage)
+        assertDecodedRepertoire(f.InfoTag()->album(), repertoireFor(c.codePage), c.codePage, "IPRD");
+      else
+        CPPUNIT_ASSERT_EQUAL(String(c.album), f.InfoTag()->album());
+    }
+  }
+
+  // Stripping the INFO tag takes the CSET chunk with it. A CSET that outlived
+  // its LIST would describe a charset for text the file no longer has.
+  void testInfoStripRemovesCset()
+  {
+    for(const char *name : {"info-latin1", "info-cp1252", "info-utf8", "info-cp1251"}) {
+      ScopedFileCopy copy(name, ".wav");
+      const string filename = copy.fileName();
+
+      {
+        RIFF::WAV::File f(filename.c_str());
+        CPPUNIT_ASSERT(f.isValid());
+        CPPUNIT_ASSERT(f.hasInfoTag());
+
+        f.strip(RIFF::WAV::File::Info);
+        CPPUNIT_ASSERT(f.InfoTag()->isEmpty());
+
+        CPPUNIT_ASSERT(f.save(RIFF::WAV::File::Info));
+        CPPUNIT_ASSERT(!f.hasInfoTag());
+      }
+
+      CPPUNIT_ASSERT(checkedRawChunk(filename, "LIST").isEmpty());
+      CPPUNIT_ASSERT(checkedRawChunk(filename, "CSET").isEmpty());
+    }
+  }
+
+  // Step 1 for every single byte code page Charset supports, driven off one
+  // table so a code page cannot be added to the tables without also being read
+  // back from a real file. Each fixture holds the whole byte range in each of
+  // its text fields and all of it is compared, so a table that is wrong at any
+  // one of the 255 positions fails instead of only where a sample differed.
+  void testInfoCodePageCatalog()
+  {
+    for(const auto &c : charsetCases) {
+      RIFF::WAV::File f(TEST_FILE_PATH_C(c.fixture));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      assertDecodedRepertoire(f.InfoTag()->artist(), c.repertoire, c.codePage, "IART");
+      assertDecodedRepertoire(f.InfoTag()->album(), c.repertoire, c.codePage, "IPRD");
+      assertDecodedRepertoire(f.InfoTag()->comment(), c.repertoire, c.codePage, "ICMT");
+    }
+  }
+
+  // The bytes the test above decodes. A fixture is the input the tables are
+  // judged on, so it is checked here instead of being assumed: it has to declare
+  // the code page the table names for it, and to hold the whole byte range in
+  // each of its text fields. The range is checked as bytes because a code page
+  // may map two bytes to one code point, and then the wrong bytes would decode
+  // to the expected text and the comparison above could not tell the difference.
+  void testCharsetFixturesAreTheWholeByteRange()
+  {
+    ByteVector wholeRange;
+    for(unsigned int b = 1; b < 256; ++b)
+      wholeRange.append(static_cast<char>(b));
+    wholeRange.append('\0');
+
+    for(const auto &c : charsetCases) {
+      const string path = TEST_FILE_PATH_C(c.fixture);
+
+      const ByteVector cset = checkedRawChunk(path, "CSET");
+      CPPUNIT_ASSERT(cset.size() >= 2u);
+      CPPUNIT_ASSERT_EQUAL(c.codePage, static_cast<unsigned int>(cset.toUShort(0, false)));
+
+      CPPUNIT_ASSERT_EQUAL(wholeRange, checkedRawInfoField(path, "IART"));
+      CPPUNIT_ASSERT_EQUAL(wholeRange, checkedRawInfoField(path, "IPRD"));
+      CPPUNIT_ASSERT_EQUAL(wholeRange, checkedRawInfoField(path, "ICMT"));
+    }
+  }
+
+  // Step 2 for every code page in that table. Each fixture is copied, retitled
+  // and written back as UTF-8, and the untouched fields are then read back from
+  // the copy: they can only survive that rewrite if the code page was decoded
+  // correctly in the first place. ICMT is the one field the rewrite replaces.
+  void testInfoCodePageCatalogSaveAsUtf8()
+  {
+    for(const auto &c : charsetCases) {
+      // ScopedFileCopy takes the fixture name without its extension.
+      string base(c.fixture);
+      base.erase(base.size() - 4);
+      ScopedFileCopy copy(base, ".wav");
+      const string filename = copy.fileName();
+
+      {
+        RIFF::WAV::File f(filename.c_str());
+        CPPUNIT_ASSERT(f.isValid());
+        CPPUNIT_ASSERT(f.hasInfoTag());
+        assertDecodedRepertoire(f.InfoTag()->artist(), c.repertoire, c.codePage, "IART");
+
+        f.InfoTag()->setTitle(kNewTitle);
+        f.InfoTag()->setComment(kNewComment);
+        CPPUNIT_ASSERT(f.save());
+      }
+
+      // Whatever it was read as, it is UTF-8 on disk now.
+      assertRawCsetDeclaresUtf8(filename);
+      const ByteVector list = checkedRawChunk(filename, "LIST");
+      CPPUNIT_ASSERT(list.find(kNewTitleUtf8) >= 0);
+      CPPUNIT_ASSERT(list.find(kNewCommentUtf8) >= 0);
+
+      {
+        RIFF::WAV::File f(filename.c_str());
+        CPPUNIT_ASSERT(f.isValid());
+        CPPUNIT_ASSERT(f.hasInfoTag());
+        CPPUNIT_ASSERT_EQUAL(kNewTitle, f.InfoTag()->title());
+        CPPUNIT_ASSERT_EQUAL(kNewComment, f.InfoTag()->comment());
+        // The 255 characters that were never touched are still all there.
+        assertDecodedRepertoire(f.InfoTag()->artist(), c.repertoire, c.codePage, "IART");
+        assertDecodedRepertoire(f.InfoTag()->album(), c.repertoire, c.codePage, "IPRD");
+      }
+    }
+  }
+
+  // Byte 0x00 is the one byte of the repertoire that cannot be part of a field's
+  // text, because decoding stops at the first NUL: that is how a string ends.
+  // It has to end the string and not turn into a character of its own.
+  void testCharsetDecodeStopsAtNul()
+  {
+    const ByteVector data("\x41\x00\x42", 3);
+    CPPUNIT_ASSERT_EQUAL(String(L"A"), Charset::decode(data, Charset::Type::Windows1251));
+    CPPUNIT_ASSERT_EQUAL(String(), Charset::decode(ByteVector("\x00\x41", 2), Charset::Type::Windows1251));
+  }
+
+  // The generated tables have to cover every code page that can be declared, and
+  // the internal representation of a string is UTF-8 from the moment it is read.
+  // There is no way to encode back into a legacy code page, precisely so that
+  // text a code page cannot hold is never quietly replaced.
+  void testCharsetTablesRoundTrip()
+  {
+    unsigned int count = 0;
+    const Charset::detail::CodePageEntry *entries =
+      Charset::detail::codePageEntries(&count);
+    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(std::size(charsetCases)), count);
+
+    // Every code page in the table is one the catalog knows how to read back,
+    // so a page cannot be added to Charset without a fixture to prove it.
+    for(unsigned int i = 0; i < count; ++i) {
+      bool covered = false;
+      for(const auto &c : charsetCases)
+        covered = covered || c.codePage == entries[i].codePage;
+      CPPUNIT_ASSERT(covered);
+      CPPUNIT_ASSERT(Charset::typeForCodePage(entries[i].codePage));
+    }
+    CPPUNIT_ASSERT_EQUAL(Charset::Type::UTF8, Charset::typeForCodePage(65001).value());
+
+    // Encoding is UTF-8 and nothing else, so text no single byte code page could
+    // ever represent survives instead of turning into '?'.
+    CPPUNIT_ASSERT_EQUAL(ByteVector("\xE4\xBD\xA0", 3), Charset::encode(String(L"\x4F60")));
+    CPPUNIT_ASSERT_EQUAL(kNewTitleUtf8, Charset::encode(kNewTitle));
+
+    // And it is a plain UTF-8 round trip, so nothing is lost on the way through.
+    const String sample(L"\x0416\x0490\x05D0\x0625\x0E01\x20A7");
+    CPPUNIT_ASSERT_EQUAL(sample, Charset::decode(Charset::encode(sample), Charset::Type::UTF8));
+  }
+
+  // A handler the user installed is an explicit override, so it outranks the
+  // code page the file declares. Otherwise setStringHandler() would do nothing
+  // at all for every file TagLib itself writes, since those all carry a CSET.
+  class FixedStringHandler : public RIFF::Info::StringHandler
+  {
+  public:
+    String parse(const ByteVector &) const override { return String(L"from the handler"); }
+    ByteVector render(const String &) const override { return ByteVector("from the handler"); }
+  };
+
+  void testInfoUserHandlerBeatsCodePage()
+  {
+    class Restore
+    {
+    public:
+      ~Restore() { RIFF::Info::Tag::setStringHandler(nullptr); }
+    } restore;
+
+    // The fixture declares 1252, and the default path reads it with that table.
+    {
+      RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1252.wav"));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT(f.InfoTag()->artist() != String(L"from the handler"));
+    }
+
+    const FixedStringHandler handler;
+    RIFF::Info::Tag::setStringHandler(&handler);
+
+    // With a handler installed it is used even though the file declares 1252,
+    // on the way in ...
+    {
+      RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1252.wav"));
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(String(L"from the handler"), f.InfoTag()->artist());
+    }
+
+    // ... and on the way out, so the handler decides the bytes as well.
+    ScopedFileCopy copy("info-cp1252", ".wav");
+    const string filename = copy.fileName();
+    {
+      RIFF::WAV::File f(filename.c_str());
+      CPPUNIT_ASSERT(f.isValid());
+      CPPUNIT_ASSERT(f.hasInfoTag());
+      CPPUNIT_ASSERT_EQUAL(String(L"from the handler"), f.InfoTag()->artist());
+      CPPUNIT_ASSERT(f.save());
+    }
+    CPPUNIT_ASSERT(checkedRawChunk(filename, "LIST")
+                     .find(ByteVector("from the handler")) >= 0);
+  }
+
+  // Removing the handler again must put the file's own code page back in charge.
+  void testInfoCodePageReturnsWithoutUserHandler()
+  {
+    RIFF::WAV::File f(TEST_FILE_PATH_C("info-cp1251.wav"));
+    CPPUNIT_ASSERT(f.isValid());
+    CPPUNIT_ASSERT(f.hasInfoTag());
+    CPPUNIT_ASSERT(f.InfoTag()->artist() != String(L"from the handler"));
+    assertDecodedRepertoire(f.InfoTag()->artist(), repertoireFor(1251), 1251, "IART");
+  }
+
   void testStripTags()
   {
     ScopedFileCopy copy("empty", ".wav");
@@ -291,7 +909,9 @@ public:
     CPPUNIT_ASSERT_EQUAL(String("Title1"), f.InfoTag()->title());
 
     f.save();
-    CPPUNIT_ASSERT_EQUAL(static_cast<offset_t>(15898), f.length());
+    // Saving the INFO tag also writes the 10 byte CSET chunk which declares
+    // that the tag is UTF-8.
+    CPPUNIT_ASSERT_EQUAL(static_cast<offset_t>(15908), f.length());
     CPPUNIT_ASSERT_EQUAL(static_cast<offset_t>(-1), f.find("Title2"));
   }
 
