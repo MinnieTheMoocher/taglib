@@ -393,7 +393,8 @@ void RIFF::Info::Tag::parse(const ByteVector &data)
 {
   const StringHandler *handler = d->effectiveHandler();
   unsigned int p = 4;
-  while(p < data.size()) {
+  // Needs a full 8-byte header; fewer bytes left would wrap the check below.
+  while(p + 8 <= data.size()) {
     const unsigned int size = data.toUInt(p + 4, false);
     if(size > data.size() - p - 8)
       break;
