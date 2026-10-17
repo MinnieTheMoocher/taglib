@@ -104,11 +104,30 @@ bool EBML::MasterElement::read(File &file, int depth)
   return read(file, depth, elementCount);
 }
 
+bool EBML::MasterElement::read(File &file, unsigned int &elementCount)
+{
+  return read(file, 0, elementCount);
+}
+
 bool EBML::MasterElement::read(File &file, int depth, unsigned int &elementCount)
 {
   static constexpr int MAX_EBML_DEPTH = 64;
-  static constexpr int MAX_EBML_ELEMENT_COUNT = 50000;
+  // Whole-file budget. Must be considerably larger than the per-level limit below: a Matroska's
+  // Cues/SeekHead index scales with duration, and a real 6.0 GB, 48-minute album measures at 99780
+  // elements, so a 50000 whole-file budget rejects ordinary media outright.
+  static constexpr int MAX_EBML_ELEMENT_COUNT = 1000000;
   static constexpr int MAX_EBML_ELEMENT_COUNT_PER_LEVEL = 50000;
+  static constexpr offset_t MIN_EBML_ELEMENT_COUNT = 1024;
+  static constexpr offset_t BYTES_PER_EBML_ELEMENT = 32;
+  // A zero-length element can occupy only two bytes on disk but takes a heap
+  // allocation and a list node in memory.  Bound the element budget by the
+  // input length, with a minimum for small but valid media files.
+  const offset_t fileLength = file.length();
+  if(fileLength < 0)
+    return false;
+  const auto maxElementCount = static_cast<unsigned int>(
+    std::min<offset_t>(MAX_EBML_ELEMENT_COUNT,
+      std::max(MIN_EBML_ELEMENT_COUNT, fileLength / BYTES_PER_EBML_ELEMENT)));
   if(depth > MAX_EBML_DEPTH) {
     debug("EBML: Maximum nesting depth exceeded");
     return false;
@@ -116,7 +135,7 @@ bool EBML::MasterElement::read(File &file, int depth, unsigned int &elementCount
   const offset_t maxOffset = file.tell() + dataSize;
   std::unique_ptr<Element> element;
   while((element = findNextElement(file, maxOffset))) {
-    if(elementCount >= MAX_EBML_ELEMENT_COUNT ||
+    if(elementCount >= maxElementCount ||
        elements.size() >= MAX_EBML_ELEMENT_COUNT_PER_LEVEL) {
       debug("EBML: Maximum element count exceeded");
       return false;
@@ -159,7 +178,7 @@ ByteVector EBML::MasterElement::render()
   buffer.append(data);
   if(minRenderSize) {
     if(const auto bufferSize = buffer.size();
-       minRenderSize >= bufferSize + MIN_VOID_ELEMENT_SIZE)
+       minRenderSize >= static_cast<offset_t>(bufferSize + MIN_VOID_ELEMENT_SIZE))
       buffer.append(VoidElement::renderSize(minRenderSize - bufferSize));
   }
   return buffer;

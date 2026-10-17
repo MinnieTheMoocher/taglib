@@ -51,6 +51,7 @@ class TestASF : public CppUnit::TestFixture
   CPPUNIT_TEST(testSavePicture);
   CPPUNIT_TEST(testSaveMultiplePictures);
   CPPUNIT_TEST(testProperties);
+  CPPUNIT_TEST(testPropertiesMultipleValues);
   CPPUNIT_TEST(testPropertiesAllSupported);
   CPPUNIT_TEST(testPropertiesRealFile);
   CPPUNIT_TEST(testRating);
@@ -309,6 +310,48 @@ public:
     CPPUNIT_ASSERT_EQUAL(StringList("3"), tags["DISCNUMBER"]);
   }
 
+  void testPropertiesMultipleValues()
+  {
+    for(const auto &key : {"TITLE", "ARTIST", "COMMENT", "COPYRIGHT"}) {
+      ScopedFileCopy copy("silence-1", ".wma");
+      {
+        ASF::File f(copy.fileName().c_str());
+        PropertyMap props;
+        props[key] = StringList("Alice").append("Bob").append("Carol");
+        props["ALBUM"] = StringList("First").append("Second");
+
+        const PropertyMap ignored = f.setProperties(props);
+        CPPUNIT_ASSERT_EQUAL(1u, ignored.size());
+        CPPUNIT_ASSERT_EQUAL(StringList("Bob").append("Carol"), ignored.value(key));
+        CPPUNIT_ASSERT_EQUAL(StringList("Alice"), f.properties().value(key));
+        CPPUNIT_ASSERT_EQUAL(props.value("ALBUM"), f.properties().value("ALBUM"));
+        CPPUNIT_ASSERT(f.save());
+      }
+      {
+        ASF::File f(copy.fileName().c_str());
+        CPPUNIT_ASSERT_EQUAL(StringList("Alice"), f.properties().value(key));
+        const StringList albums = f.properties().value("ALBUM");
+        CPPUNIT_ASSERT_EQUAL(2u, albums.size());
+        CPPUNIT_ASSERT(albums.contains("First"));
+        CPPUNIT_ASSERT(albums.contains("Second"));
+
+        PropertyMap props;
+        props[key] = StringList("Solo");
+        CPPUNIT_ASSERT(f.setProperties(props).isEmpty());
+        CPPUNIT_ASSERT_EQUAL(StringList("Solo"), f.properties().value(key));
+
+        props[key].clear();
+        CPPUNIT_ASSERT(f.setProperties(props).isEmpty());
+        CPPUNIT_ASSERT(!f.properties().contains(key));
+
+        props[key] = StringList("Solo");
+        CPPUNIT_ASSERT(f.setProperties(props).isEmpty());
+        CPPUNIT_ASSERT(f.setProperties(PropertyMap()).isEmpty());
+        CPPUNIT_ASSERT(!f.properties().contains(key));
+      }
+    }
+  }
+
   void testPropertiesAllSupported()
   {
     PropertyMap tags;
@@ -562,7 +605,7 @@ public:
     ScopedFileCopy copy("silence-1", ".wma");
     {
       ASF::File f(copy.fileName().c_str());
-      f.tag()->setAttribute("WM/SharedUserRating", static_cast<unsigned int>(75));
+      f.tag()->setAttribute("WM/SharedUserRating", 75U);
       f.tag()->setAttribute("POPULARIMETER", String("player@example.com|128|0"));
       f.save();
     }
@@ -602,12 +645,12 @@ public:
     {
       // Once WM/SharedUserRating exists, writes go to it.
       ASF::File f(copy.fileName().c_str());
-      f.tag()->setAttribute("WM/SharedUserRating", static_cast<unsigned int>(99));
+      f.tag()->setAttribute("WM/SharedUserRating", 99U);
       PropertyMap props = f.properties();
       CPPUNIT_ASSERT_EQUAL(StringList("99"), props["RATING"]);
       props["RATING"] = StringList("50");
       f.setProperties(props);
-      CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(50),
+      CPPUNIT_ASSERT_EQUAL(50U,
         f.tag()->attribute("WM/SharedUserRating").front().toUInt());
       f.save();
     }
@@ -645,7 +688,7 @@ public:
     CPPUNIT_ASSERT(map.find("WM/SharedUserRating") != map.end());
     CPPUNIT_ASSERT_EQUAL(ASF::Attribute::DWordType,
       map["WM/SharedUserRating"].front().type());
-    CPPUNIT_ASSERT_EQUAL(static_cast<unsigned int>(75),
+    CPPUNIT_ASSERT_EQUAL(75U,
       map["WM/SharedUserRating"].front().toUInt());
     CPPUNIT_ASSERT(map.find("POPULARIMETER") != map.end());
     CPPUNIT_ASSERT_EQUAL(ASF::Attribute::UnicodeType,
