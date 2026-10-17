@@ -517,8 +517,6 @@ set(toolkit_SRCS
   toolkit/tdebuglistener.cpp
   toolkit/tzlib.cpp
   toolkit/tversionnumber.cpp
-  toolkit/charset.cpp
-  toolkit/charsettables.cpp
 )
 
 set(tag_LIB_SRCS

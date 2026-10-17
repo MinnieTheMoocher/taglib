@@ -25,51 +25,17 @@
 
 #include "wavfile.h"
 
-#include "charset.h"
-
 #include "tdebug.h"
 #include "tpropertymap.h"
 #include "tagutils.h"
 #include "infotag.h"
 #include "tagunion.h"
 
-#include <optional>
-
 using namespace TagLib;
 
 namespace
 {
   enum { ID3v2Index = 0, InfoIndex = 1 };
-
-  /*!
-   * A CSET chunk declares the code page of the LIST/INFO text and is laid out as
-   *   struct { DWORD cb; WORD wLanguage; WORD pad; } CSET;
-   * i.e. a 32-bit code page followed by 4 reserved bytes.
-   * https://www.robotplanet.dk/audio/wav_meta_data/riff_mci.pdf
-   */
-  constexpr unsigned int CSETChunkSize = 8;
-
-  ByteVector renderCSET(unsigned int codePage)
-  {
-    ByteVector cset = ByteVector::fromUInt(codePage, false);
-    cset.resize(CSETChunkSize, 0);
-    return cset;
-  }
-
-  /*!
-   * Reads the code page out of a CSET payload. A conforming chunk carries a
-   * 32-bit code page; a 2-byte payload is accepted too, so files written before
-   * the code page was widened are still read as the encoding they declared
-   * instead of silently falling back to the RIFF default of Latin-1.
-   */
-  std::optional<unsigned int> parseCSET(const ByteVector &data)
-  {
-    if(data.size() >= 4)
-      return data.toUInt(0, false);
-    if(data.size() >= 2)
-      return static_cast<unsigned int>(data.toUShort(0, false));
-    return std::nullopt;
-  }
 } // namespace
 
 class RIFF::WAV::File::FilePrivate
@@ -89,7 +55,6 @@ public:
 
   bool hasID3v2 { false };
   bool hasInfo { false };
-  bool hasCSET { false };
   bool hasiXML { false };
   bool hasBEXT { false };
 
@@ -254,17 +219,9 @@ bool RIFF::WAV::File::save(TagTypes tags, StripTags strip, ID3v2::Version versio
   if(tags & Info) {
     removeTagChunks(Info);
 
-    // render() is empty when no field survives, which is also when there is
-    // nothing for a CSET chunk to describe.
-    const ByteVector info = InfoTag() ? InfoTag()->render() : ByteVector();
-    if(!info.isEmpty()) {
-      setChunkData("LIST", info, true);
-
-      // The INFO tag was just rendered as UTF-8, so say so.
-      // Without this a reader would fall back to the RIFF default of Latin1 and decode wrongly.
-      setChunkData("CSET", renderCSET(Charset::codePageForType(Charset::Type::UTF8)));
+    if(InfoTag() && !InfoTag()->isEmpty()) {
+      setChunkData("LIST", InfoTag()->render(), true);
       d->hasInfo = true;
-      d->hasCSET = true;
     }
   }
 
@@ -297,9 +254,6 @@ bool RIFF::WAV::File::hasBEXTData() const
 
 void RIFF::WAV::File::read(bool readProperties)
 {
-  std::optional<unsigned int> codePage;
-  ByteVector infoData;
-
   for(unsigned int i = 0; i < chunkCount(); ++i) {
     if(const ByteVector name = chunkName(i); name == "ID3 " || name == "id3 ") {
       if(!d->tag[ID3v2Index]) {
@@ -311,25 +265,14 @@ void RIFF::WAV::File::read(bool readProperties)
         debug("RIFF::WAV::File::read() - Duplicate ID3v2 tag found.");
       }
     }
-    else if(name == "CSET") {
-      if(d->hasCSET) {
-        debug("RIFF::WAV::File::read() - Duplicate CSET chunk found.");
-      }
-      else if(const ByteVector data = chunkData(i); const auto page = parseCSET(data)) {
-        codePage = *page;
-        d->hasCSET = true;
-      }
-      else {
-        debug("RIFF::WAV::File::read() - Invalid CSET chunk found.");
-      }
-    }
     else if(name == "LIST") {
       if(const ByteVector data = chunkData(i); data.startsWith("INFO")) {
-        if(!infoData.isEmpty()) {
-          debug("RIFF::WAV::File::read() - Duplicate INFO tag found.");
+        if(!d->tag[InfoIndex]) {
+          d->tag.set(InfoIndex, new RIFF::Info::Tag(data));
+          d->hasInfo = true;
         }
         else {
-          infoData = data;
+          debug("RIFF::WAV::File::read() - Duplicate INFO tag found.");
         }
       }
     }
@@ -341,11 +284,6 @@ void RIFF::WAV::File::read(bool readProperties)
       d->hasBEXT = true;
       d->bextData = chunkData(i);
     }
-  }
-
-  if(!infoData.isEmpty()) {
-    d->tag.set(InfoIndex, new RIFF::Info::Tag(infoData, codePage.value_or(0)));
-    d->hasInfo = true;
   }
 
   if(!d->tag[ID3v2Index])
@@ -367,17 +305,12 @@ void RIFF::WAV::File::removeTagChunks(TagTypes tags)
     d->hasID3v2 = false;
   }
 
-  if((tags & Info) && (d->hasInfo || d->hasCSET)) {
+  if((tags & Info) && d->hasInfo) {
     for(int i = static_cast<int>(chunkCount()) - 1; i >= 0; --i) {
       if(chunkName(i) == "LIST" && chunkData(i).startsWith("INFO"))
         removeChunk(i);
     }
 
-    // A CSET chunk is only meaningful together with an INFO tag, so it goes
-    // when the INFO tag goes. save() writes a new one if it writes the tag back.
-    removeChunk("CSET");
-
     d->hasInfo = false;
-    d->hasCSET = false;
   }
 }
