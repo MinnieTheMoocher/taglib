@@ -77,11 +77,11 @@ ByteVector TagLib::Charset::encode(const String &s, Type type)
     // String::data(Latin1) casts every code point to char, keeping only the
     // low byte, so the '?' substitution the header promises is done here.
     ByteVector data(s.size(), '?');
-    unsigned int i = 0;
+    char *p = data.data();
     for(const wchar_t c : s) {
       if(c < 256)
-        data[i] = static_cast<char>(c);
-      ++i;
+        *p = static_cast<char>(c);
+      ++p;
     }
     return data;
   }
