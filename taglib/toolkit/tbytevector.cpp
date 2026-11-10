@@ -134,8 +134,12 @@ T toNumber(const ByteVector &v, size_t offset, bool mostSignificantByteFirst)
   const bool isBigEndian = Utils::systemByteOrder() == Utils::BigEndian;
   const bool swap = mostSignificantByteFirst != isBigEndian;
 
-  if(offset + sizeof(T) > v.size())
-    return toNumber<T>(v, offset, v.size() - offset, mostSignificantByteFirst);
+  if(offset >= v.size())
+    return toNumber<T>(v, offset, 0, mostSignificantByteFirst);
+
+  const size_t remaining = v.size() - offset;
+  if(sizeof(T) > remaining)
+    return toNumber<T>(v, offset, remaining, mostSignificantByteFirst);
 
   // Uses memcpy instead of reinterpret_cast to avoid an alignment exception.
   T tmp;
@@ -893,6 +897,19 @@ ByteVector ByteVector::fromBase64(const ByteVector & input)
     0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
     0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80
   };
+
+  // Some encoders wrap the output into lines (e.g. MIME style base64 with a
+  // line break every 76 characters), skip such whitespace.
+  const auto isWhitespace = [](char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+  };
+  if(std::any_of(input.begin(), input.end(), isWhitespace)) {
+    ByteVector stripped(input.size());
+    const auto end = std::remove_copy_if(input.begin(), input.end(),
+                                         stripped.begin(), isWhitespace);
+    stripped.resize(static_cast<unsigned int>(end - stripped.begin()));
+    return fromBase64(stripped);
+  }
 
   unsigned int len = input.size();
 
